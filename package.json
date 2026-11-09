@@ -1,0 +1,13 @@
+{
+  "name": "project-nexus",
+  "version": "0.1.0",
+  "description": "Project NEXUS - Global Brain of Computers starter skeleton",
+  "main": "nexus/node_app.js",
+  "type": "commonjs",
+  "scripts": {
+    "demo": "node nexus/node_app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,170 @@
+"use strict";
+
+const { Discovery } = require("./discovery");
+const { ComputeType, MicroWorkload, Task, TaskState } = require("./task");
+
+/**
+ * Resource matching engine and scheduler for Project NEXUS.
+ *
+ * Weighted scoring model:
+ *   w1 capability_match  = 0.30
+ *   w2 telemetry         = 0.20
+ *   w3 reputation        = 0.20
+ *   w4 geo_proximity     = 0.15
+ *   w5 current_load      = 0.10
+ *   w6 cost              = 0.05
+ */
+
+class SchedulingDecision {
+  constructor({ microWorkloadId, nodeId, score, reason } = {}) {
+    this.microWorkloadId = microWorkloadId;
+    this.nodeId = nodeId;
+    this.score = score;
+    this.reason = reason;
+  }
+}
+
+class NodeScore {
+  constructor({ record, telemetry, score, breakdown } = {}) {
+    this.record = record;
+    this.telemetry = telemetry;
+    this.score = score;
+    this.breakdown = breakdown;
+  }
+}
+
+class Scheduler {
+  constructor(discovery) {
+    this.discovery = discovery;
+    this.telemetry = {}; // nodeId -> Telemetry
+    this.nodeTasks = {}; // nodeId -> Task[]
+    this.decisions = [];
+  }
+
+  static W_CAPABILITY = 0.30;
+  static W_TELEMETRY = 0.20;
+  static W_REPUTATION = 0.20;
+  static W_GEO = 0.15;
+  static W_LOAD = 0.10;
+  static W_COST = 0.05;
+
+  updateTelemetry(telemetry) {
+    this.telemetry[telemetry.nodeId] = telemetry;
+  }
+
+  getTelemetry(nodeId) {
+    return this.telemetry[nodeId] || null;
+  }
+
+  scoreNode(record, requirements, submitterRegion = "unknown") {
+    const telemetry = this.getTelemetry(record.nodeId);
+    if (!telemetry) return null;
+
+    const capMatch = record.hasCapability(requirements.computeType) ? 1.0 : 0.0;
+    const utilPenalty = Math.max(telemetry.cpuUtil, telemetry.gpuUtil) / 100.0;
+    const telemetryScore = 1.0 - utilPenalty;
+    const reputationScore = Math.min(1.0, Math.max(0.0, record.reputation));
+    const geoScore = record.geoRegion === submitterRegion ? 1.0 : 0.5;
+    const loadScore = 1.0 - telemetry.loadFactor;
+    const costScore = 1.0 / (1.0 + record.priceCreditsPerCycle);
+
+    const score =
+      Scheduler.W_CAPABILITY * capMatch +
+      Scheduler.W_TELEMETRY * telemetryScore +
+      Scheduler.W_REPUTATION * reputationScore +
+      Scheduler.W_GEO * geoScore +
+      Scheduler.W_LOAD * loadScore +
+      Scheduler.W_COST * costScore;
+
+    const breakdown = {
+      capability: capMatch,
+      telemetry: telemetryScore,
+      reputation: reputationScore,
+      geo: geoScore,
+      load: loadScore,
+      cost: costScore,
+    };
+    return new NodeScore({ record, telemetry, score, breakdown });
+  }
+
+  schedule(microWorkload, submitterRegion = "unknown", topK = 3) {
+    const candidates = this.discovery.lookupByCapability({
+      capType: microWorkload.requirements.computeType,
+      minCount: 1,
+      minReputation: 0.3,
+    });
+    if (!candidates.length) return null;
+
+    const scored = [];
+    for (const rec of candidates) {
+      const ns = this.scoreNode(rec, microWorkload.requirements, submitterRegion);
+      if (!ns) continue;
+      if (ns.telemetry.loadFactor >= 1.0) continue;
+      scored.push(ns);
+    }
+    if (!scored.length) return null;
+
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0];
+
+    const task = new Task({
+      id: `task:${microWorkload.id}`,
+      microWorkloadId: microWorkload.id,
+      nodeId: best.record.nodeId,
+      state: TaskState.ASSIGNED,
+    });
+    if (!this.nodeTasks[best.record.nodeId]) this.nodeTasks[best.record.nodeId] = [];
+    this.nodeTasks[best.record.nodeId].push(task);
+
+    const decision = new SchedulingDecision({
+      microWorkloadId: microWorkload.id,
+      nodeId: best.record.nodeId,
+      score: best.score,
+      reason: [
+        `cap=${best.breakdown.capability.toFixed(2)}`,
+        `tel=${best.breakdown.telemetry.toFixed(2)}`,
+        `rep=${best.breakdown.reputation.toFixed(2)}`,
+        `geo=${best.breakdown.geo.toFixed(2)}`,
+        `load=${best.breakdown.load.toFixed(2)}`,
+        `cost=${best.breakdown.cost.toFixed(2)}`,
+      ].join(" "),
+    });
+    this.decisions.push(decision);
+    return decision;
+  }
+
+  reassignOnFailure(task, microWorkload, submitterRegion = "unknown") {
+    task.markFailed();
+    const candidates = this.discovery.lookupByCapability({
+      capType: microWorkload.requirements.computeType,
+      minCount: 1,
+      minReputation: 0.3,
+    }).filter((r) => r.nodeId !== task.nodeId);
+    if (!candidates.length) return null;
+    const bestRec = candidates[0];
+    const ns = this.scoreNode(bestRec, microWorkload.requirements, submitterRegion);
+    if (!ns) return null;
+    const newTask = new Task({
+      id: `task:${microWorkload.id}:retry${task.failureCount}`,
+      microWorkloadId: microWorkload.id,
+      nodeId: bestRec.nodeId,
+      state: TaskState.ASSIGNED,
+    });
+    if (!this.nodeTasks[bestRec.nodeId]) this.nodeTasks[bestRec.nodeId] = [];
+    this.nodeTasks[bestRec.nodeId].push(newTask);
+    const decision = new SchedulingDecision({
+      microWorkloadId: microWorkload.id,
+      nodeId: bestRec.nodeId,
+      score: ns.score,
+      reason: "reassignment after node failure",
+    });
+    this.decisions.push(decision);
+    return decision;
+  }
+
+  getTasksForNode(nodeId) {
+    return this.nodeTasks[nodeId] || [];
+  }
+}
+
+module.exports = { Scheduler, SchedulingDecision, NodeScore };
