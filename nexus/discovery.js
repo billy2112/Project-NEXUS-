@@ -1,20 +1,25 @@
 "use strict";
 
-const { NodeRecord } = require("./node");
-const { ComputeType } = require("./task");
+const { sha256, now, ComputeType, NodeMode } = require("./types");
+const { NodeRecord, Capability } = require("./node");
 
 /**
- * Kademlia-inspired discovery and registration for Project NEXUS nodes.
+ * Kademlia-inspired discovery and registration.
  *
- * Skeleton keeps an in-memory routing table and record store so the
- * heartbeat + task-distribution demo runs standalone. Production would back
- * this with libp2p Kademlia DHT + GossipSub.
+ * Features:
+ *  - DHT record store (node_id -> NodeRecord)
+ *  - Capability index (cap_type -> set of node_ids)
+ *  - k-bucket routing table with client/server mode distinction
+ *  - NAT traversal status tracking
+ *  - Heartbeat TTL and stale-node detection
+ *  - Sybil resistance via hardware fingerprint + stake
  */
 
 const HEARTBEAT_TTL_S = 60;
+const K_BUCKET_SIZE = 20;
 
 class PeerInfo {
-  constructor({ nodeId, multiaddrs = [], lastSeen = Date.now() / 1000 } = {}) {
+  constructor({ nodeId, multiaddrs = [], lastSeen = now() } = {}) {
     this.nodeId = nodeId;
     this.multiaddrs = multiaddrs;
     this.lastSeen = lastSeen;
@@ -22,22 +27,28 @@ class PeerInfo {
 }
 
 class Discovery {
-  constructor({ nodeId } = {}) {
-    this.nodeId = nodeId || require("./index").generateNodeId();
-    this.records = {}; // nodeId -> NodeRecord
-    this.capIndex = {}; // capType -> Set of nodeIds
-    this.kBuckets = {}; // prefix -> PeerInfo[]
-    this.bootstrapPeers = [];
+  constructor({ nodeId, mode = NodeMode.CLIENT, bootstrapPeers = [] } = {}) {
+    this.nodeId = nodeId || `node:${require("crypto").randomBytes(16).toString("hex")}`;
+    this.mode = mode;
+    this.records = {};
+    this.capIndex = {};
+    this.kBuckets = {};
+    this.bootstrapPeers = bootstrapPeers;
     this._seq = 0;
+    this.gossipSubscribers = new Map(); // topic -> Set of callbacks
   }
 
   register(record) {
+    // Sybil resistance: reject records with missing hardware fingerprint unless staked
+    if (!record.hardwareFingerprint && record.stakeCredits < 10) {
+      throw new Error("Sybil check failed: hardware fingerprint or stake required");
+    }
     this.records[record.nodeId] = record;
     this._reindexCapabilities();
     this._touchRouting(record.nodeId, record.multiaddrs);
   }
 
-  lookupByCapability({ capType, minCount = 1, minReputation = 0 } = {}) {
+  lookupByCapability({ capType, minCount = 1, minReputation = 0, mode = null } = {}) {
     const candidates = [];
     const ids = this.capIndex[capType] || new Set();
     for (const nodeId of ids) {
@@ -45,7 +56,8 @@ class Discovery {
       if (!rec) continue;
       if (!rec.hasCapability(capType, minCount)) continue;
       if (rec.reputation < minReputation) continue;
-      if (Date.now() / 1000 - rec.lastSeen > HEARTBEAT_TTL_S) continue;
+      if (now() - rec.lastSeen > HEARTBEAT_TTL_S) continue;
+      if (mode && rec.mode !== mode) continue;
       candidates.push(rec);
     }
     candidates.sort((a, b) => b.reputation - a.reputation || a.priceCreditsPerCycle - b.priceCreditsPerCycle);
@@ -60,27 +72,47 @@ class Discovery {
     return Object.values(this.records);
   }
 
-  ingestHeartbeat(nodeId, multiaddrs) {
+  ingestHeartbeat(nodeId, multiaddrs, telemetryOverride) {
     let rec = this.records[nodeId];
     if (!rec) {
       rec = new NodeRecord({ nodeId, multiaddrs, capabilities: [] });
     }
-    rec.lastSeen = Date.now() / 1000;
+    rec.lastSeen = now();
     rec.multiaddrs = multiaddrs;
+    if (telemetryOverride && telemetryOverride.natStatus) rec.natStatus = telemetryOverride.natStatus;
     this.records[nodeId] = rec;
     this._touchRouting(nodeId, multiaddrs);
+    return rec;
   }
 
   staleNodes() {
-    const now = Date.now() / 1000;
+    const t = now();
     return Object.entries(this.records)
-      .filter(([, rec]) => now - rec.lastSeen > HEARTBEAT_TTL_S)
+      .filter(([, rec]) => t - rec.lastSeen > HEARTBEAT_TTL_S)
       .map(([nodeId]) => nodeId);
   }
 
   nextSeq() {
     this._seq += 1;
     return this._seq;
+  }
+
+  // GossipSub-style pub/sub
+  subscribe(topic, cb) {
+    if (!this.gossipSubscribers.has(topic)) this.gossipSubscribers.set(topic, new Set());
+    this.gossipSubscribers.get(topic).add(cb);
+    return () => {
+      const set = this.gossipSubscribers.get(topic);
+      if (set) set.delete(cb);
+    };
+  }
+
+  publish(topic, message) {
+    const set = this.gossipSubscribers.get(topic);
+    if (!set) return;
+    for (const cb of set) {
+      try { cb(message); } catch (e) { /* ignore subscriber errors */ }
+    }
   }
 
   _reindexCapabilities() {
@@ -99,14 +131,13 @@ class Discovery {
     if (!bucket) { bucket = []; this.kBuckets[prefix] = bucket; }
     bucket = bucket.filter((p) => p.nodeId !== nodeId);
     bucket.unshift(new PeerInfo({ nodeId, multiaddrs }));
-    if (bucket.length > 20) bucket.pop();
+    if (bucket.length > K_BUCKET_SIZE) bucket.pop();
     this.kBuckets[prefix] = bucket;
   }
 
   _bucketPrefix(nodeId) {
-    const crypto = require("crypto");
-    return crypto.createHash("sha256").update(nodeId).digest("hex").slice(0, 2);
+    return sha256(nodeId).slice(0, 2);
   }
 }
 
-module.exports = { Discovery, HEARTBEAT_TTL_S };
+module.exports = { Discovery, HEARTBEAT_TTL_S, PeerInfo };

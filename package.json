@@ -1,13 +1,20 @@
 {
   "name": "project-nexus",
-  "version": "0.1.0",
-  "description": "Project NEXUS - Global Brain of Computers starter skeleton",
-  "main": "nexus/node_app.js",
+  "version": "1.0.0",
+  "description": "Project NEXUS - Global Brain of Computers: a decentralized distributed computational network with P2P discovery, workload scheduling, sandboxed execution, zk verification, reputation & credits, and a responsive web interface.",
+  "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "demo": "node nexus/node_app.js"
+    "start": "node server.js",
+    "demo": "node nexus/node_app.js",
+    "test": "node test_integration.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
   }
 }

@@ -204,7 +204,8 @@ async function runDemo() {
   );
 
   for (const mw of job.microWorkloads) {
-    const decision = nodeA.scheduler.schedule(mw, "us-east");
+    const outcome = nodeA.scheduler.schedule(mw, "us-east");
+    const decision = outcome ? outcome.decision : null;
     if (!decision) {
       console.log(`[NEXUS] No candidate for ${mw.id}`);
       continue;
