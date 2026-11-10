@@ -1,5 +1,7 @@
 # Project NEXUS — Global Brain of Computers
 
+**Live demo:** https://billy2112.github.io/Project-NEXUS-/docs/
+
 A globally distributed, decentralized computational network that pools
 heterogeneous compute resources (CPUs, GPUs, NPUs, edge devices, enterprise
 servers) into a unified, self-organizing "Global Brain."
